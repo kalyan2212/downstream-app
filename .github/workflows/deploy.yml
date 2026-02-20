@@ -1,0 +1,103 @@
+name: Deploy to Azure
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+env:
+  ARM_CLIENT_ID:       ${{ secrets.ARM_CLIENT_ID }}
+  ARM_CLIENT_SECRET:   ${{ secrets.ARM_CLIENT_SECRET }}
+  ARM_TENANT_ID:       ${{ secrets.ARM_TENANT_ID }}
+  ARM_SUBSCRIPTION_ID: ${{ secrets.ARM_SUBSCRIPTION_ID }}
+
+jobs:
+  terraform:
+    name: Terraform - Provision Infrastructure
+    runs-on: ubuntu-latest
+    outputs:
+      lb_public_ip: ${{ steps.tf_output.outputs.lb_public_ip }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.7.x"
+          terraform_wrapper: false
+
+      - name: Terraform Init
+        working-directory: ./terraform
+        run: |
+          terraform init \
+            -backend-config="storage_account_name=${{ secrets.TF_STORAGE_ACCOUNT }}"
+
+      - name: Terraform Plan
+        working-directory: ./terraform
+        env:
+          TF_VAR_db_password:          ${{ secrets.DB_PASSWORD }}
+          TF_VAR_replication_password: ${{ secrets.REPLICATION_PASSWORD }}
+          TF_VAR_ssh_public_key:       ${{ secrets.SSH_PUBLIC_KEY }}
+          TF_VAR_flask_secret:         ${{ secrets.FLASK_SECRET }}
+          TF_VAR_admin_username:       "kalyan2212"
+          TF_VAR_upstream_url:         ${{ secrets.UPSTREAM_URL }}
+        run: terraform plan -out=tfplan
+
+      - name: Terraform Apply
+        working-directory: ./terraform
+        env:
+          TF_VAR_db_password:          ${{ secrets.DB_PASSWORD }}
+          TF_VAR_replication_password: ${{ secrets.REPLICATION_PASSWORD }}
+          TF_VAR_ssh_public_key:       ${{ secrets.SSH_PUBLIC_KEY }}
+          TF_VAR_flask_secret:         ${{ secrets.FLASK_SECRET }}
+          TF_VAR_admin_username:       "kalyan2212"
+          TF_VAR_upstream_url:         ${{ secrets.UPSTREAM_URL }}
+        run: terraform apply tfplan
+
+      - name: Capture Terraform Outputs
+        id: tf_output
+        working-directory: ./terraform
+        run: |
+          LB_IP=$(terraform output -raw lb_public_ip)
+          echo "lb_public_ip=$LB_IP" >> "$GITHUB_OUTPUT"
+          echo "===================================="
+          echo "  App URL : http://$LB_IP"
+          echo "  SSH VM 0: ssh -p 2201 kalyan2212@$LB_IP"
+          echo "  SSH VM 1: ssh -p 2202 kalyan2212@$LB_IP"
+          echo "===================================="
+
+  deploy:
+    name: Deploy - SSH Code Push
+    needs: terraform
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Deploy to App VMs via SSH
+        env:
+          LB_IP:           ${{ needs.terraform.outputs.lb_public_ip }}
+          SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+        run: |
+          mkdir -p ~/.ssh
+          printf '%s\n' "$SSH_PRIVATE_KEY" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+
+          SSH_OPTS="-i ~/.ssh/deploy_key -o StrictHostKeyChecking=no -o ConnectTimeout=30 -o BatchMode=yes"
+
+          DEPLOY_SCRIPT='
+            set -e
+            cd /opt/downstream-app
+            git pull origin main
+            ./venv/bin/pip install -r requirements.txt --quiet
+            sudo systemctl restart downstream
+            echo "Restart successful on $(hostname)"
+          '
+
+          for port in 2201 2202; do
+            echo "=== Deploying to VM via LB port $port ==="
+            ssh $SSH_OPTS -p "$port" kalyan2212@"$LB_IP" "$DEPLOY_SCRIPT" \
+              || echo "[WARN] SSH to port $port failed - VM may still be initializing"
+          done
+
+          echo "Application URL: http://$LB_IP"
