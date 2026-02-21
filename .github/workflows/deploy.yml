@@ -101,6 +101,7 @@ jobs:
     name: Health Check
     needs: [terraform, deploy]
     runs-on: ubuntu-latest
+    permissions: {}
 
     steps:
       - name: Wait for app to be ready
