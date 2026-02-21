@@ -1,0 +1,41 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+.eggs/
+venv/
+.venv/
+env/
+
+# App runtime files
+last_run.txt
+*.db
+*.sqlite3
+
+# Environment / secrets
+.env
+*.env.*
+!.env.example
+
+# Terraform
+terraform/.terraform/
+terraform/.terraform.lock.hcl
+terraform/terraform.tfstate
+terraform/terraform.tfstate.backup
+terraform/terraform.tfvars
+terraform/tfplan
+terraform/*.tfplan
+terraform/*.pem
+terraform/*.key
+
+# OS
+.DS_Store
+Thumbs.db
+
+# VS Code
+.vscode/
