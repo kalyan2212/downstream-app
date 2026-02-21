@@ -10,37 +10,38 @@ Downstream data management web app – Flask + PostgreSQL, deployed to Azure VM 
 
 ## Deploy in One Command (Azure Cloud Shell)
 
-> **Why Cloud Shell?** The Azure account (`kbdazure@gmail.com`) is a Microsoft personal account (MSA). Direct username/password login from CI is blocked by Microsoft. Azure Cloud Shell already has an authenticated Azure session, so one interactive login is all that's needed.
+> **Why Cloud Shell?** The Azure account (`kbdazure@gmail.com`) is a Microsoft personal account (MSA). Direct username/password login from CI is blocked by Microsoft. Azure Cloud Shell is already authenticated, so no extra login is needed.
 
-### Step 1 — Open Azure Cloud Shell
+### Step 1 — Create a GitHub PAT (classic token)
 
-Go to **[shell.azure.com](https://shell.azure.com)** (or click the `>_` button in the Azure Portal) and sign in as `kbdazure@gmail.com`.
+> ⚠️ Use a **classic** token — fine-grained tokens sometimes fail with `gh secret set`.
 
-### Step 2 — Create a GitHub PAT
-
-1. Go to: https://github.com/settings/tokens/new  
+1. Go to: https://github.com/settings/tokens/new?type=classic  
    - Token name: `downstream-deploy`  
    - Expiration: 90 days  
-   - Scopes: check **`repo`** (includes secrets write)
-2. Copy the token (starts with `ghp_...`)
+   - Check the **`repo`** scope (the top-level checkbox — this includes secrets access)
+2. Click **Generate token**, then copy it (starts with `ghp_...`)
+
+### Step 2 — Open Azure Cloud Shell
+
+Go to **[shell.azure.com](https://shell.azure.com)** (already logged in as `kbdazure@gmail.com`).
 
 ### Step 3 — Run the setup script
-
-Paste this into Azure Cloud Shell:
 
 ```bash
 curl -sSL https://raw.githubusercontent.com/kalyan2212/downstream-app/copilot/deploy-app-to-azure/scripts/complete-setup.sh \
   | GITHUB_PAT=ghp_YOUR_TOKEN_HERE bash
 ```
 
-Replace `ghp_YOUR_TOKEN_HERE` with the PAT from Step 2.
+Replace `ghp_YOUR_TOKEN_HERE` with the PAT from Step 1.
 
-**That's it.** The script takes ~5 minutes and:
-- Creates an Azure Service Principal
-- Provisions Terraform state storage
-- Generates an SSH keypair
-- Sets 9 GitHub secrets
-- Triggers the Deploy workflow automatically
+**The script (~5 min):**
+- Validates your PAT against the GitHub API
+- Uses the existing Cloud Shell Azure session (no re-login needed)
+- Creates a Service Principal + Terraform state storage + SSH keys
+- Sets 9 GitHub secrets, triggers the Deploy workflow
+
+**Tip:** If you get a PAT error, check the token has the full `repo` scope selected.
 
 ---
 
