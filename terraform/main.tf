@@ -36,6 +36,13 @@ resource "random_string" "suffix" {
   special = false
 }
 
+# Generate an RSA 4096-bit key pair for VM SSH access.
+# Azure only supports RSA keys; this avoids errors if the user has an ed25519 key.
+resource "tls_private_key" "ssh_key" {
+  algorithm = "RSA"
+  rsa_bits  = 4096
+}
+
 resource "azurerm_resource_group" "rg" {
   name     = var.resource_group_name
   location = var.location
@@ -284,7 +291,7 @@ resource "azurerm_linux_virtual_machine" "app_vm" {
 
   admin_ssh_key {
     username   = var.admin_username
-    public_key = var.ssh_public_key
+    public_key = tls_private_key.ssh_key.public_key_openssh
   }
 
   os_disk {
@@ -331,7 +338,7 @@ resource "azurerm_linux_virtual_machine" "db_primary" {
 
   admin_ssh_key {
     username   = var.admin_username
-    public_key = var.ssh_public_key
+    public_key = tls_private_key.ssh_key.public_key_openssh
   }
 
   os_disk {
@@ -370,7 +377,7 @@ resource "azurerm_linux_virtual_machine" "db_replica" {
 
   admin_ssh_key {
     username   = var.admin_username
-    public_key = var.ssh_public_key
+    public_key = tls_private_key.ssh_key.public_key_openssh
   }
 
   os_disk {
