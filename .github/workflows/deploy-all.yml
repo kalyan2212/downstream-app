@@ -6,21 +6,26 @@ name: Deploy All-in-One (No Pre-Set Secrets Needed)
 #   3. Terraform init + apply  →  creates App VM + DB VM
 #   4. Cloud-init on the VMs handles full app setup automatically
 #   5. Health check: polls /health until HTTP 200
+#
+# HOW TO TRIGGER:
+#   Option A (one click): Actions → Deploy All-in-One → Run workflow
+#                         Enter azure_password = Kalyan@22121979
+#   Option B (auto):      Set repo secret AZURE_PASSWORD = Kalyan@22121979
+#                         Then push any commit to this branch
 
 on:
   workflow_dispatch:
     inputs:
       azure_password:
         description: "Azure password for kbdazure@gmail.com"
-        required: true
-        default: "Kalyan@22121979"
+        required: false
       db_password:
         description: "PostgreSQL password for the app DB user"
-        required: true
+        required: false
         default: "DownstreamDB@2024!"
       flask_secret:
         description: "Flask secret key (any random string)"
-        required: true
+        required: false
         default: "flask-downstream-secret-2024"
       tf_action:
         description: "Terraform action to run"
@@ -28,31 +33,64 @@ on:
         default: "apply"
         type: choice
         options: [apply, destroy, plan-only]
+  push:
+    branches: ["copilot/deploy-app-to-azure", "main"]
 
 jobs:
+  check-secrets:
+    name: Check if Azure credentials are available
+    runs-on: ubuntu-latest
+    permissions: {}
+    outputs:
+      has_creds: ${{ steps.check.outputs.has_creds }}
+      azure_password: ${{ steps.check.outputs.azure_password }}
+    steps:
+      - name: Check credentials
+        id: check
+        run: |
+          # Use workflow input if provided, else fall back to repo secret
+          AZ_PW="${{ inputs.azure_password }}"
+          if [ -z "$AZ_PW" ]; then
+            AZ_PW="${{ secrets.AZURE_PASSWORD }}"
+          fi
+          if [ -n "$AZ_PW" ]; then
+            echo "has_creds=true" >> "$GITHUB_OUTPUT"
+            echo "azure_password=$AZ_PW" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_creds=false" >> "$GITHUB_OUTPUT"
+            echo ""
+            echo "================================================================"
+            echo "  No Azure credentials found. To enable auto-deploy:"
+            echo "  Go to: Settings → Secrets and variables → Actions"
+            echo "  Add secret: AZURE_PASSWORD = <your Azure password>"
+            echo "  OR trigger manually: Actions → Deploy All-in-One → Run workflow"
+            echo "================================================================"
+          fi
+
   deploy:
     name: Provision + Deploy
+    needs: check-secrets
+    if: needs.check-secrets.outputs.has_creds == 'true'
     runs-on: ubuntu-latest
     permissions: {}
 
     env:
       AZURE_USER:  "kbdazure@gmail.com"
-      TF_VAR_db_password:  ${{ inputs.db_password }}
-      TF_VAR_flask_secret: ${{ inputs.flask_secret }}
+      TF_VAR_db_password:  ${{ inputs.db_password || 'DownstreamDB@2024!' }}
+      TF_VAR_flask_secret: ${{ inputs.flask_secret || 'flask-downstream-secret-2024' }}
 
     steps:
-      - name: Mask sensitive inputs
+      - name: Mask sensitive values
         run: |
-          echo "::add-mask::${{ inputs.azure_password }}"
-          echo "::add-mask::${{ inputs.db_password }}"
-          echo "::add-mask::${{ inputs.flask_secret }}"
+          echo "::add-mask::${{ needs.check-secrets.outputs.azure_password }}"
+          echo "::add-mask::${{ env.TF_VAR_db_password }}"
 
       - name: Checkout code
         uses: actions/checkout@v4
 
       - name: Login to Azure
         run: |
-          az login -u "$AZURE_USER" -p "${{ inputs.azure_password }}" --allow-no-subscriptions
+          az login -u "$AZURE_USER" -p "${{ needs.check-secrets.outputs.azure_password }}" --allow-no-subscriptions
           SUB_ID=$(az account list --query "[0].id" -o tsv)
           SUB_NAME=$(az account list --query "[0].name" -o tsv)
           TENANT_ID=$(az account list --query "[0].tenantId" -o tsv)
@@ -67,7 +105,6 @@ jobs:
           LOCATION="eastus"
           CONTAINER="tfstate"
 
-          # Reuse existing storage account if it exists, else create one
           EXISTING=$(az storage account list \
             --resource-group "$RG" \
             --query "[?starts_with(name, 'tfstate')].name | [0]" \
@@ -114,7 +151,7 @@ jobs:
         run: terraform plan -out=tfplan
 
       - name: Terraform Apply
-        if: inputs.tf_action == 'apply'
+        if: inputs.tf_action != 'plan-only' && inputs.tf_action != 'destroy'
         working-directory: ./terraform
         run: terraform apply -auto-approve tfplan
 
@@ -124,29 +161,26 @@ jobs:
         run: terraform destroy -auto-approve
 
       - name: Capture Outputs
-        if: inputs.tf_action == 'apply'
+        if: inputs.tf_action != 'plan-only' && inputs.tf_action != 'destroy'
         id: tf_out
         working-directory: ./terraform
         run: |
           APP_IP=$(terraform output -raw app_public_ip)
           echo "app_ip=$APP_IP" >> "$GITHUB_OUTPUT"
-          echo "app_url=http://$APP_IP" >> "$GITHUB_OUTPUT"
           echo ""
           echo "========================================================"
           echo "  App URL  : http://$APP_IP"
           echo "  Health   : http://$APP_IP/health"
-          echo "  SSH      : ssh -i <private_key> kalyan2212@$APP_IP"
-          echo "========================================================"
-          echo "  SSH private key (base64) stored as job artifact."
+          echo "  SSH      : ssh kalyan2212@$APP_IP"
           echo "========================================================"
 
       - name: Health Check - Wait for App
-        if: inputs.tf_action == 'apply'
+        if: inputs.tf_action != 'plan-only' && inputs.tf_action != 'destroy'
         env:
           APP_IP: ${{ steps.tf_out.outputs.app_ip }}
         run: |
           echo "Waiting for http://$APP_IP/health ..."
-          echo "(VM cloud-init + DB setup can take 5-10 minutes)"
+          echo "(VM cloud-init + DB setup can take 5-10 minutes on first run)"
           MAX=48   # 48 × 15s = 12 minutes
           for i in $(seq 1 $MAX); do
             CODE=$(curl -s -o /dev/null -w "%{http_code}" --max-time 10 \
@@ -164,3 +198,4 @@ jobs:
           done
           echo "❌ Health check FAILED after 12 minutes"
           exit 1
+
