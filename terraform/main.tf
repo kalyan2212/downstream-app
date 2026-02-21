@@ -1,24 +1,12 @@
-# Downstream App - Azure Infrastructure
-# All resources in Availability Zone 1, East US
+# Downstream App - Azure Infrastructure (low-cost, no HA)
 #
-# Topology:
-#   Internet --> Azure Load Balancer (Standard, public IP)
-#     Port 80   --> App VM 0 :80
-#     Port 80   --> App VM 1 :80
-#     Port 2201 --> App VM 0 :22  (SSH NAT)
-#     Port 2202 --> App VM 1 :22  (SSH NAT)
-#
-#   App Subnet 10.0.1.0/24
-#     App VM 0  (nginx + gunicorn + flask)
-#     App VM 1  (nginx + gunicorn + flask)
-#
-#   DB Subnet 10.0.2.0/24
-#     DB Primary  10.0.2.4  (PostgreSQL 15, primary)
-#     DB Replica  10.0.2.5  (PostgreSQL 15, hot standby)
+# Topology (single-VM, direct public IP – no load balancer):
+#   Internet --> App VM public IP :80  (nginx → gunicorn → Flask)
+#                                 :22  (SSH)
+#   DB VM (private, db-subnet)    :5432 (PostgreSQL 15)
 
 locals {
-  db_primary_ip    = "10.0.2.4"
-  db_replica_ip    = "10.0.2.5"
+  db_ip            = "10.0.2.4"
   ubuntu_publisher = "Canonical"
   ubuntu_offer     = "0001-com-ubuntu-server-jammy"
   ubuntu_sku       = "22_04-lts-gen2"
@@ -28,12 +16,6 @@ locals {
     environment = "production"
     managed_by  = "terraform"
   }
-}
-
-resource "random_string" "suffix" {
-  length  = 6
-  upper   = false
-  special = false
 }
 
 resource "azurerm_resource_group" "rg" {
@@ -112,19 +94,8 @@ resource "azurerm_network_security_group" "db_nsg" {
     destination_address_prefix = "*"
   }
   security_rule {
-    name                       = "allow-postgres-replication"
-    priority                   = 110
-    direction                  = "Inbound"
-    access                     = "Allow"
-    protocol                   = "Tcp"
-    source_port_range          = "*"
-    destination_port_range     = "5432"
-    source_address_prefix      = var.db_subnet_prefix
-    destination_address_prefix = "*"
-  }
-  security_rule {
     name                       = "allow-ssh"
-    priority                   = 120
+    priority                   = 110
     direction                  = "Inbound"
     access                     = "Allow"
     protocol                   = "Tcp"
@@ -145,78 +116,18 @@ resource "azurerm_subnet_network_security_group_association" "db_nsg_assoc" {
   network_security_group_id = azurerm_network_security_group.db_nsg.id
 }
 
-resource "azurerm_public_ip" "lb_pip" {
-  name                = "downstream-lb-pip"
+# App VM - direct public IP (Basic tier is cheapest; no LB needed)
+resource "azurerm_public_ip" "app_pip" {
+  name                = "downstream-app-pip"
   location            = azurerm_resource_group.rg.location
   resource_group_name = azurerm_resource_group.rg.name
   allocation_method   = "Static"
-  sku                 = "Standard"
-  zones               = [var.availability_zone]
+  sku                 = "Basic"
   tags                = local.tags
-}
-
-resource "azurerm_lb" "app_lb" {
-  name                = "downstream-lb"
-  location            = azurerm_resource_group.rg.location
-  resource_group_name = azurerm_resource_group.rg.name
-  sku                 = "Standard"
-  tags                = local.tags
-
-  frontend_ip_configuration {
-    name                 = "frontend"
-    public_ip_address_id = azurerm_public_ip.lb_pip.id
-    zones                = [var.availability_zone]
-  }
-}
-
-resource "azurerm_lb_backend_address_pool" "app_pool" {
-  name            = "app-backend-pool"
-  loadbalancer_id = azurerm_lb.app_lb.id
-}
-
-resource "azurerm_lb_probe" "http_probe" {
-  name                = "http-probe"
-  loadbalancer_id     = azurerm_lb.app_lb.id
-  protocol            = "Tcp"
-  port                = 80
-  interval_in_seconds = 5
-  number_of_probes    = 2
-}
-
-resource "azurerm_lb_rule" "http_rule" {
-  name                           = "http-rule"
-  loadbalancer_id                = azurerm_lb.app_lb.id
-  protocol                       = "Tcp"
-  frontend_port                  = 80
-  backend_port                   = 80
-  frontend_ip_configuration_name = "frontend"
-  backend_address_pool_ids       = [azurerm_lb_backend_address_pool.app_pool.id]
-  probe_id                       = azurerm_lb_probe.http_probe.id
-  disable_outbound_snat          = true
-}
-
-resource "azurerm_lb_outbound_rule" "app_outbound" {
-  name                    = "app-outbound"
-  loadbalancer_id         = azurerm_lb.app_lb.id
-  protocol                = "All"
-  backend_address_pool_id = azurerm_lb_backend_address_pool.app_pool.id
-  frontend_ip_configuration { name = "frontend" }
-}
-
-resource "azurerm_lb_nat_rule" "ssh_nat" {
-  count                          = 2
-  name                           = "ssh-vm-${count.index}"
-  resource_group_name            = azurerm_resource_group.rg.name
-  loadbalancer_id                = azurerm_lb.app_lb.id
-  protocol                       = "Tcp"
-  frontend_port                  = 2201 + count.index
-  backend_port                   = 22
-  frontend_ip_configuration_name = "frontend"
 }
 
 resource "azurerm_network_interface" "app_nic" {
-  count               = 2
-  name                = "app-vm-${count.index}-nic"
+  name                = "app-vm-nic"
   location            = azurerm_resource_group.rg.location
   resource_group_name = azurerm_resource_group.rg.name
   tags                = local.tags
@@ -225,62 +136,19 @@ resource "azurerm_network_interface" "app_nic" {
     name                          = "internal"
     subnet_id                     = azurerm_subnet.app_subnet.id
     private_ip_address_allocation = "Dynamic"
-  }
-}
-
-resource "azurerm_network_interface_backend_address_pool_association" "app_pool_assoc" {
-  count                   = 2
-  network_interface_id    = azurerm_network_interface.app_nic[count.index].id
-  ip_configuration_name   = "internal"
-  backend_address_pool_id = azurerm_lb_backend_address_pool.app_pool.id
-}
-
-resource "azurerm_network_interface_nat_rule_association" "app_ssh_nat_assoc" {
-  count                 = 2
-  network_interface_id  = azurerm_network_interface.app_nic[count.index].id
-  ip_configuration_name = "internal"
-  nat_rule_id           = azurerm_lb_nat_rule.ssh_nat[count.index].id
-}
-
-resource "azurerm_network_interface" "db_primary_nic" {
-  name                = "db-primary-nic"
-  location            = azurerm_resource_group.rg.location
-  resource_group_name = azurerm_resource_group.rg.name
-  tags                = local.tags
-
-  ip_configuration {
-    name                          = "internal"
-    subnet_id                     = azurerm_subnet.db_subnet.id
-    private_ip_address_allocation = "Static"
-    private_ip_address            = local.db_primary_ip
-  }
-}
-
-resource "azurerm_network_interface" "db_replica_nic" {
-  name                = "db-replica-nic"
-  location            = azurerm_resource_group.rg.location
-  resource_group_name = azurerm_resource_group.rg.name
-  tags                = local.tags
-
-  ip_configuration {
-    name                          = "internal"
-    subnet_id                     = azurerm_subnet.db_subnet.id
-    private_ip_address_allocation = "Static"
-    private_ip_address            = local.db_replica_ip
+    public_ip_address_id          = azurerm_public_ip.app_pip.id
   }
 }
 
 resource "azurerm_linux_virtual_machine" "app_vm" {
-  count               = 2
-  name                = "app-vm-${count.index}"
+  name                = "app-vm"
   location            = azurerm_resource_group.rg.location
   resource_group_name = azurerm_resource_group.rg.name
   size                = var.vm_size
   admin_username      = var.admin_username
-  zone                = var.availability_zone
   tags                = local.tags
 
-  network_interface_ids = [azurerm_network_interface.app_nic[count.index].id]
+  network_interface_ids = [azurerm_network_interface.app_nic.id]
 
   admin_ssh_key {
     username   = var.admin_username
@@ -301,7 +169,7 @@ resource "azurerm_linux_virtual_machine" "app_vm" {
   }
 
   custom_data = base64encode(templatefile("${path.module}/cloud-init-app.sh.tpl", {
-    db_host        = local.db_primary_ip
+    db_host        = local.db_ip
     db_name        = var.db_name
     db_user        = var.db_user
     db_password    = var.db_password
@@ -311,23 +179,32 @@ resource "azurerm_linux_virtual_machine" "app_vm" {
     github_repo    = var.github_repo_url
     admin_username = var.admin_username
   }))
-
-  depends_on = [
-    azurerm_network_interface_backend_address_pool_association.app_pool_assoc,
-    azurerm_network_interface_nat_rule_association.app_ssh_nat_assoc,
-  ]
 }
 
-resource "azurerm_linux_virtual_machine" "db_primary" {
-  name                = "db-primary"
+# DB VM - private only (no public IP)
+resource "azurerm_network_interface" "db_nic" {
+  name                = "db-nic"
+  location            = azurerm_resource_group.rg.location
+  resource_group_name = azurerm_resource_group.rg.name
+  tags                = local.tags
+
+  ip_configuration {
+    name                          = "internal"
+    subnet_id                     = azurerm_subnet.db_subnet.id
+    private_ip_address_allocation = "Static"
+    private_ip_address            = local.db_ip
+  }
+}
+
+resource "azurerm_linux_virtual_machine" "db_vm" {
+  name                = "db-vm"
   location            = azurerm_resource_group.rg.location
   resource_group_name = azurerm_resource_group.rg.name
   size                = var.vm_size
   admin_username      = var.admin_username
-  zone                = var.availability_zone
   tags                = local.tags
 
-  network_interface_ids = [azurerm_network_interface.db_primary_nic.id]
+  network_interface_ids = [azurerm_network_interface.db_nic.id]
 
   admin_ssh_key {
     username   = var.admin_username
@@ -336,8 +213,8 @@ resource "azurerm_linux_virtual_machine" "db_primary" {
 
   os_disk {
     caching              = "ReadWrite"
-    storage_account_type = "StandardSSD_LRS"
-    disk_size_gb         = 64
+    storage_account_type = "Standard_LRS"
+    disk_size_gb         = 32
   }
 
   source_image_reference {
@@ -347,49 +224,10 @@ resource "azurerm_linux_virtual_machine" "db_primary" {
     version   = local.ubuntu_version
   }
 
-  custom_data = base64encode(templatefile("${path.module}/cloud-init-db-primary.sh.tpl", {
-    db_name              = var.db_name
-    db_user              = var.db_user
-    db_password          = var.db_password
-    replication_password = var.replication_password
-    replica_ip           = local.db_replica_ip
-    app_subnet           = var.app_subnet_prefix
+  custom_data = base64encode(templatefile("${path.module}/cloud-init-db.sh.tpl", {
+    db_name    = var.db_name
+    db_user    = var.db_user
+    db_password = var.db_password
+    app_subnet = var.app_subnet_prefix
   }))
-}
-
-resource "azurerm_linux_virtual_machine" "db_replica" {
-  name                = "db-replica"
-  location            = azurerm_resource_group.rg.location
-  resource_group_name = azurerm_resource_group.rg.name
-  size                = var.vm_size
-  admin_username      = var.admin_username
-  zone                = var.availability_zone
-  tags                = local.tags
-
-  network_interface_ids = [azurerm_network_interface.db_replica_nic.id]
-
-  admin_ssh_key {
-    username   = var.admin_username
-    public_key = var.ssh_public_key
-  }
-
-  os_disk {
-    caching              = "ReadWrite"
-    storage_account_type = "StandardSSD_LRS"
-    disk_size_gb         = 64
-  }
-
-  source_image_reference {
-    publisher = local.ubuntu_publisher
-    offer     = local.ubuntu_offer
-    sku       = local.ubuntu_sku
-    version   = local.ubuntu_version
-  }
-
-  custom_data = base64encode(templatefile("${path.module}/cloud-init-db-replica.sh.tpl", {
-    primary_ip           = local.db_primary_ip
-    replication_password = var.replication_password
-  }))
-
-  depends_on = [azurerm_linux_virtual_machine.db_primary]
 }

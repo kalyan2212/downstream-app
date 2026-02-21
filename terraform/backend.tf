@@ -6,23 +6,21 @@ terraform {
       source  = "hashicorp/azurerm"
       version = "~> 3.90"
     }
-    random = {
-      source  = "hashicorp/random"
-      version = "~> 3.6"
-    }
   }
 
   # Remote state in Azure Blob Storage.
-  # Storage account is pre-created by scripts/bootstrap_tfstate.sh
-  # Value is passed via -backend-config in CI.
+  # Bootstrapped by the bootstrap.yml workflow on first run.
+  # ARM_* env vars supply authentication (set by bootstrap workflow).
   backend "azurerm" {
     resource_group_name = "tfstate-rg"
     container_name      = "tfstate"
     key                 = "downstream.tfstate"
-    # storage_account_name supplied at init time via -backend-config
+    # storage_account_name passed via -backend-config at init time
   }
 }
 
 provider "azurerm" {
   features {}
+  # Authenticates via ARM_CLIENT_ID / ARM_CLIENT_SECRET / ARM_TENANT_ID / ARM_SUBSCRIPTION_ID
+  # environment variables set in GitHub Actions workflows.
 }

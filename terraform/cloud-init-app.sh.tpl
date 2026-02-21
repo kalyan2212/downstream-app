@@ -49,7 +49,7 @@ Group=www-data
 WorkingDirectory=/opt/downstream-app
 EnvironmentFile=/opt/downstream-app/.env
 ExecStart=/opt/downstream-app/venv/bin/gunicorn \
-    --workers 4 \
+    --workers 2 \
     --bind 127.0.0.1:5001 \
     --access-logfile /var/log/downstream-access.log \
     --error-logfile /var/log/downstream-error.log \
@@ -60,6 +60,32 @@ RestartSec=5
 [Install]
 WantedBy=multi-user.target
 SVCEOF
+
+# Auto-update service: pulls latest code from GitHub and restarts
+cat > /etc/systemd/system/downstream-update.service << 'UPDEOF'
+[Unit]
+Description=Downstream App Auto-Update
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=www-data
+WorkingDirectory=/opt/downstream-app
+ExecStart=/bin/bash -c "git pull origin main && ./venv/bin/pip install -r requirements.txt -q && systemctl restart downstream"
+UPDEOF
+
+cat > /etc/systemd/system/downstream-update.timer << 'TIMEOF'
+[Unit]
+Description=Downstream App Auto-Update Timer
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=5min
+Unit=downstream-update.service
+
+[Install]
+WantedBy=timers.target
+TIMEOF
 
 cat > /etc/nginx/sites-available/downstream << 'NGXEOF'
 server {
@@ -106,8 +132,8 @@ init_db()
 fi
 
 systemctl daemon-reload
-systemctl enable downstream nginx
-systemctl start downstream
+systemctl enable downstream nginx downstream-update.timer
+systemctl start downstream downstream-update.timer
 systemctl restart nginx
 
 echo "[$(date)] App VM setup complete."

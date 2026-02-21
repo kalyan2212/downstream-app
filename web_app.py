@@ -229,6 +229,15 @@ def api_update_customer(customer_id):
     return jsonify({"message": "Updated", "id": customer_id})
 
 
+@app.route("/health")
+def health():
+    try:
+        query("SELECT 1", fetch="one")
+        return jsonify({"status": "ok", "db": "reachable"}), 200
+    except Exception as exc:
+        return jsonify({"status": "error", "db": str(exc)}), 500
+
+
 if __name__ == "__main__":
     init_db()
     print("Downstream web app running at http://localhost:5001")
