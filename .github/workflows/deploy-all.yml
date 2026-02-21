@@ -1,0 +1,161 @@
+name: Deploy All-in-One
+
+# Requires these GitHub secrets (set by the Bootstrap workflow):
+#   ARM_CLIENT_ID, ARM_CLIENT_SECRET, ARM_TENANT_ID, ARM_SUBSCRIPTION_ID
+#   TF_STORAGE_ACCOUNT, DB_PASSWORD, REPLICATION_PASSWORD, FLASK_SECRET
+#
+# SSH keys are generated automatically by Terraform (no SSH_PUBLIC_KEY secret needed).
+#
+# First time? Run "Bootstrap - First-Time Azure Setup" workflow first.
+
+on:
+  workflow_dispatch:
+    inputs:
+      tf_action:
+        description: "Terraform action to run"
+        required: true
+        default: "apply"
+        type: choice
+        options: [apply, destroy, plan-only]
+  push:
+    branches: [main]
+
+jobs:
+  check-secrets:
+    name: Check if Azure credentials are available
+    runs-on: ubuntu-latest
+    permissions: {}
+    outputs:
+      has_creds: ${{ steps.check.outputs.has_creds }}
+    steps:
+      - name: Check Service Principal credentials
+        id: check
+        run: |
+          if [ -n "${{ secrets.ARM_CLIENT_ID }}" ]; then
+            echo "has_creds=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_creds=false" >> "$GITHUB_OUTPUT"
+            echo ""
+            echo "================================================================"
+            echo "  No Azure Service Principal credentials found."
+            echo "  Run the 'Bootstrap - First-Time Azure Setup' workflow first:"
+            echo "  Actions → Bootstrap → Run workflow"
+            echo "================================================================"
+          fi
+
+  deploy:
+    name: Provision + Deploy
+    needs: check-secrets
+    if: needs.check-secrets.outputs.has_creds == 'true'
+    runs-on: ubuntu-latest
+    permissions: {}
+
+    env:
+      ARM_CLIENT_ID:        ${{ secrets.ARM_CLIENT_ID }}
+      ARM_CLIENT_SECRET:    ${{ secrets.ARM_CLIENT_SECRET }}
+      ARM_TENANT_ID:        ${{ secrets.ARM_TENANT_ID }}
+      ARM_SUBSCRIPTION_ID:  ${{ secrets.ARM_SUBSCRIPTION_ID }}
+      TF_VAR_db_password:          ${{ secrets.DB_PASSWORD }}
+      TF_VAR_replication_password: ${{ secrets.REPLICATION_PASSWORD }}
+      TF_VAR_flask_secret:         ${{ secrets.FLASK_SECRET }}
+      TF_VAR_upstream_url:         ${{ secrets.UPSTREAM_URL }}
+      ADMIN_USERNAME: "kalyan2212"
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Login to Azure (Service Principal)
+        run: |
+          az login --service-principal \
+            -u "$ARM_CLIENT_ID" \
+            -p "$ARM_CLIENT_SECRET" \
+            --tenant "$ARM_TENANT_ID"
+          az account set --subscription "$ARM_SUBSCRIPTION_ID"
+          az account show --query "{name:name, id:id}" -o table
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.7.x"
+          terraform_wrapper: false
+
+      - name: Terraform Init
+        working-directory: ./terraform
+        run: |
+          terraform init \
+            -backend-config="storage_account_name=${{ secrets.TF_STORAGE_ACCOUNT }}"
+
+      - name: Terraform Plan
+        working-directory: ./terraform
+        run: terraform plan -out=tfplan
+
+      - name: Terraform Apply
+        if: inputs.tf_action != 'plan-only' && inputs.tf_action != 'destroy'
+        working-directory: ./terraform
+        run: terraform apply -auto-approve tfplan
+
+      - name: Terraform Destroy
+        if: inputs.tf_action == 'destroy'
+        working-directory: ./terraform
+        run: terraform destroy -auto-approve
+
+      - name: Capture Outputs & Deploy via SSH
+        if: inputs.tf_action != 'plan-only' && inputs.tf_action != 'destroy'
+        id: tf_out
+        working-directory: ./terraform
+        run: |
+          LB_IP=$(terraform output -raw lb_public_ip)
+          echo "lb_ip=$LB_IP" >> "$GITHUB_OUTPUT"
+
+          mkdir -p ~/.ssh
+          terraform output -raw ssh_private_key > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+
+          echo ""
+          echo "========================================================"
+          echo "  App URL : http://$LB_IP"
+          echo "  SSH VM 0: ssh -p 2201 $ADMIN_USERNAME@$LB_IP"
+          echo "  SSH VM 1: ssh -p 2202 $ADMIN_USERNAME@$LB_IP"
+          echo "========================================================"
+
+          SSH_OPTS="-i ~/.ssh/deploy_key -o StrictHostKeyChecking=no -o ConnectTimeout=30 -o BatchMode=yes"
+          DEPLOY_SCRIPT='
+            set -e
+            cd /opt/downstream-app
+            git pull origin main
+            ./venv/bin/pip install -r requirements.txt --quiet
+            sudo systemctl restart downstream
+            echo "Restart successful on $(hostname)"
+          '
+
+          for port in 2201 2202; do
+            echo "=== Deploying to VM via LB port $port ==="
+            ssh $SSH_OPTS -p "$port" "$ADMIN_USERNAME"@"$LB_IP" "$DEPLOY_SCRIPT" \
+              || echo "[WARN] SSH to port $port failed - VM may still be initializing"
+          done
+
+      - name: Health Check - Wait for App
+        if: inputs.tf_action != 'plan-only' && inputs.tf_action != 'destroy'
+        env:
+          LB_IP: ${{ steps.tf_out.outputs.lb_ip }}
+        run: |
+          echo "Waiting for http://$LB_IP/health ..."
+          echo "(VM cloud-init + DB setup can take 5-10 minutes on first run)"
+          MAX=48   # 48 × 15s = 12 minutes
+          for i in $(seq 1 $MAX); do
+            CODE=$(curl -s -o /dev/null -w "%{http_code}" --max-time 10 \
+              "http://$LB_IP/health" 2>/dev/null || echo "000")
+            echo "  attempt $i/$MAX  - HTTP $CODE"
+            if [ "$CODE" = "200" ]; then
+              echo ""
+              echo "✅ Health check PASSED"
+              curl -s "http://$LB_IP/health"
+              echo ""
+              echo "🚀 Application is live at: http://$LB_IP"
+              exit 0
+            fi
+            sleep 15
+          done
+          echo "❌ Health check FAILED after 12 minutes"
+          exit 1

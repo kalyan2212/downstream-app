@@ -205,6 +205,15 @@ def edit(customer_id):
     return render_template("edit.html", customer=customer)
 
 
+@app.route("/health")
+def health():
+    try:
+        query("SELECT 1", fetch="one")
+        return jsonify({"status": "ok", "db": "connected"}), 200
+    except Exception:
+        return jsonify({"status": "error", "db": "unavailable"}), 503
+
+
 @app.route("/api/customers", methods=["GET"])
 def api_customers():
     rows = query("SELECT * FROM customers ORDER BY id") or []

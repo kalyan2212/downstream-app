@@ -22,11 +22,6 @@ variable "admin_username" {
   default     = "kalyan2212"
 }
 
-variable "ssh_public_key" {
-  description = "SSH public key content for VM authentication"
-  sensitive   = true
-}
-
 variable "db_name"     { default = "downstream" }
 variable "db_user"     { default = "downstream_user" }
 variable "db_password" {
