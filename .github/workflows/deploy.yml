@@ -1,8 +1,8 @@
 name: Deploy to Azure
 
-# Code-update workflow: runs Terraform (detect drift) + health check.
-# Requires AZURE_PASSWORD secret to be set in repo settings.
-# For first-time provisioning, use the "Deploy All-in-One" workflow instead.
+# Continuous deployment: triggered on push to main.
+# Requires Service Principal secrets set by the Bootstrap workflow.
+# Run "Bootstrap - First-Time Azure Setup" first if secrets aren't configured.
 
 on:
   push:
@@ -10,112 +10,84 @@ on:
   workflow_dispatch:
 
 jobs:
-  terraform:
-    name: Terraform - Provision/Update Infrastructure
+  deploy:
+    name: Terraform + Health Check
     runs-on: ubuntu-latest
     permissions: {}
-    outputs:
-      app_public_ip: ${{ steps.tf_output.outputs.app_public_ip }}
-      has_creds: ${{ steps.creds.outputs.has_creds }}
+
+    env:
+      ARM_CLIENT_ID:       ${{ secrets.ARM_CLIENT_ID }}
+      ARM_CLIENT_SECRET:   ${{ secrets.ARM_CLIENT_SECRET }}
+      ARM_TENANT_ID:       ${{ secrets.ARM_TENANT_ID }}
+      ARM_SUBSCRIPTION_ID: ${{ secrets.ARM_SUBSCRIPTION_ID }}
+      TF_VAR_db_password:  ${{ secrets.DB_PASSWORD }}
+      TF_VAR_flask_secret: ${{ secrets.FLASK_SECRET }}
+      TF_VAR_ssh_public_key: ${{ secrets.SSH_PUBLIC_KEY }}
 
     steps:
-      - name: Check Azure credentials
-        id: creds
+      - name: Check Service Principal credentials
         run: |
-          if [ -n "${{ secrets.AZURE_PASSWORD }}" ] || [ -n "${{ secrets.ARM_CLIENT_ID }}" ]; then
-            echo "has_creds=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "has_creds=false" >> "$GITHUB_OUTPUT"
-            echo "No Azure credentials configured. Set AZURE_PASSWORD secret to enable auto-deploy."
-            echo "Use the 'Deploy All-in-One' workflow for first-time deployment."
+          if [ -z "$ARM_CLIENT_ID" ]; then
+            echo "No Azure credentials configured."
+            echo "Run 'Bootstrap - First-Time Azure Setup' workflow first."
+            exit 0
           fi
 
       - name: Checkout code
-        if: steps.creds.outputs.has_creds == 'true'
+        if: env.ARM_CLIENT_ID != ''
         uses: actions/checkout@v4
 
-      - name: Login to Azure
-        if: steps.creds.outputs.has_creds == 'true'
+      - name: Login to Azure (Service Principal)
+        if: env.ARM_CLIENT_ID != ''
         run: |
-          echo "::add-mask::${{ secrets.AZURE_PASSWORD }}"
-          if [ -n "${{ secrets.ARM_CLIENT_ID }}" ]; then
-            # Use service principal if available
-            az login --service-principal \
-              -u "${{ secrets.ARM_CLIENT_ID }}" \
-              -p "${{ secrets.ARM_CLIENT_SECRET }}" \
-              --tenant "${{ secrets.ARM_TENANT_ID }}"
-            az account set --subscription "${{ secrets.ARM_SUBSCRIPTION_ID }}"
-          else
-            # Fall back to user credentials
-            az login -u "kbdazure@gmail.com" -p "${{ secrets.AZURE_PASSWORD }}"
-          fi
-
-      - name: Get Terraform State Storage
-        if: steps.creds.outputs.has_creds == 'true'
-        run: |
-          STORAGE=$(az storage account list \
-            --resource-group "tfstate-rg" \
-            --query "[?starts_with(name, 'tfstate')].name | [0]" \
-            -o tsv 2>/dev/null || true)
-          echo "TF_STORAGE=$STORAGE" >> "$GITHUB_ENV"
+          az login --service-principal \
+            -u "$ARM_CLIENT_ID" \
+            -p "$ARM_CLIENT_SECRET" \
+            --tenant "$ARM_TENANT_ID"
+          az account set --subscription "$ARM_SUBSCRIPTION_ID"
 
       - name: Setup Terraform
-        if: steps.creds.outputs.has_creds == 'true'
+        if: env.ARM_CLIENT_ID != ''
         uses: hashicorp/setup-terraform@v3
         with:
           terraform_version: "1.7.x"
           terraform_wrapper: false
 
       - name: Terraform Init
-        if: steps.creds.outputs.has_creds == 'true'
+        if: env.ARM_CLIENT_ID != ''
         working-directory: ./terraform
         run: |
           terraform init \
-            -backend-config="storage_account_name=$TF_STORAGE"
+            -backend-config="storage_account_name=${{ secrets.TF_STORAGE_ACCOUNT }}"
 
       - name: Terraform Plan
-        if: steps.creds.outputs.has_creds == 'true'
+        if: env.ARM_CLIENT_ID != ''
         working-directory: ./terraform
-        env:
-          TF_VAR_db_password:  ${{ secrets.DB_PASSWORD }}
-          TF_VAR_flask_secret: ${{ secrets.FLASK_SECRET }}
         run: terraform plan -out=tfplan
 
       - name: Terraform Apply
-        if: steps.creds.outputs.has_creds == 'true'
+        if: env.ARM_CLIENT_ID != ''
         working-directory: ./terraform
-        env:
-          TF_VAR_db_password:  ${{ secrets.DB_PASSWORD }}
-          TF_VAR_flask_secret: ${{ secrets.FLASK_SECRET }}
         run: terraform apply tfplan
 
-      - name: Capture Terraform Outputs
-        if: steps.creds.outputs.has_creds == 'true'
-        id: tf_output
+      - name: Capture Outputs
+        if: env.ARM_CLIENT_ID != ''
+        id: tf_out
         working-directory: ./terraform
         run: |
           APP_IP=$(terraform output -raw app_public_ip)
-          echo "app_public_ip=$APP_IP" >> "$GITHUB_OUTPUT"
-          echo "===================================="
-          echo "  App URL : http://$APP_IP"
-          echo "  SSH     : ssh kalyan2212@$APP_IP"
-          echo "===================================="
+          echo "app_ip=$APP_IP" >> "$GITHUB_OUTPUT"
+          echo "App URL: http://$APP_IP"
 
-  health-check:
-    name: Health Check
-    needs: terraform
-    runs-on: ubuntu-latest
-    permissions: {}
-    if: needs.terraform.outputs.has_creds == 'true' && needs.terraform.result == 'success'
-
-    steps:
-      - name: Wait for app to be ready
+      - name: Health Check
+        if: env.ARM_CLIENT_ID != ''
         env:
-          APP_IP: ${{ needs.terraform.outputs.app_public_ip }}
+          APP_IP: ${{ steps.tf_out.outputs.app_ip }}
         run: |
-          echo "Waiting for http://$APP_IP/health to respond..."
+          echo "Waiting for http://$APP_IP/health ..."
           for i in $(seq 1 24); do
-            STATUS=$(curl -s -o /dev/null -w "%{http_code}" --max-time 10 "http://$APP_IP/health" || true)
+            STATUS=$(curl -s -o /dev/null -w "%{http_code}" --max-time 10 \
+              "http://$APP_IP/health" || true)
             echo "  attempt $i/24 - HTTP $STATUS"
             if [ "$STATUS" = "200" ]; then
               echo "Health check PASSED"
@@ -125,7 +97,5 @@ jobs:
             fi
             sleep 15
           done
-          echo "Health check FAILED after 6 minutes"
+          echo "Health check FAILED"
           exit 1
-
-

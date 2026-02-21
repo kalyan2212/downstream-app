@@ -1,19 +1,26 @@
-name: Bootstrap - First-Time Azure Setup
+name: Bootstrap - First-Time Azure Setup (Device Code Login)
+
+# Run this ONCE to set up all required GitHub secrets.
+#
+# STEPS:
+#  1. Go to Actions → Bootstrap → Run workflow
+#  2. Enter your GitHub PAT (Secrets: read/write permission on this repo)
+#  3. Click Run workflow
+#  4. Open the workflow log - you will see a URL and a short code like:
+#       To sign in, use a web browser to open https://microsoft.com/devicelogin
+#       and enter the code XXXXXXXX
+#  5. Open that URL in your browser and enter the code (you have ~15 minutes)
+#  6. After you authenticate, the workflow completes automatically and stores
+#     all required GitHub secrets. Then run "Deploy All-in-One" to deploy.
 
 on:
   workflow_dispatch:
     inputs:
-      azure_username:
-        description: "Azure login email (e.g. kbdazure@gmail.com)"
-        required: true
-      azure_password:
-        description: "Azure login password"
-        required: true
       github_pat:
-        description: "GitHub PAT with Secrets read/write permission on this repo (classic: repo scope; fine-grained: Secrets: Read and write)"
+        description: "GitHub PAT (classic: repo scope  OR  fine-grained: Secrets read/write)"
         required: true
       db_password:
-        description: "PostgreSQL password to set for the app"
+        description: "PostgreSQL password for the app"
         required: true
         default: "DownstreamDB@2024!"
       flask_secret:
@@ -23,61 +30,79 @@ on:
 
 jobs:
   bootstrap:
-    name: Bootstrap Azure + GitHub Secrets
+    name: Bootstrap Azure Credentials
     runs-on: ubuntu-latest
     permissions: {}
 
     steps:
-      - name: Login to Azure (username/password)
+      - name: Mask PAT in logs
         run: |
-          # Mask credentials in logs
-          echo "::add-mask::${{ inputs.azure_password }}"
           echo "::add-mask::${{ inputs.github_pat }}"
-          az login -u "${{ inputs.azure_username }}" -p "${{ inputs.azure_password }}" --allow-no-subscriptions
-          az account list --output table
+          echo "::add-mask::${{ inputs.db_password }}"
+          echo "::add-mask::${{ inputs.flask_secret }}"
+
+      - name: Login to Azure (Device Code - watch logs for the code!)
+        run: |
+          echo "============================================================"
+          echo "  IMPORTANT: Watch the log output below."
+          echo "  You will see a URL and a short code."
+          echo "  Open the URL and enter the code to complete authentication."
+          echo "  You have approximately 15 minutes."
+          echo "============================================================"
+          echo ""
+          # --tenant common works for personal Microsoft accounts (MSA)
+          az login --use-device-code --tenant common --allow-no-subscriptions
 
       - name: Select Subscription
         run: |
-          # Use first available subscription
+          az account list --output table
           SUB_ID=$(az account list --query "[0].id" -o tsv)
           SUB_NAME=$(az account list --query "[0].name" -o tsv)
           TENANT_ID=$(az account list --query "[0].tenantId" -o tsv)
           az account set --subscription "$SUB_ID"
-          echo "Using subscription: $SUB_NAME ($SUB_ID)"
-          echo "SUB_ID=$SUB_ID"     >> "$GITHUB_ENV"
+          echo "Using subscription: $SUB_NAME ($SUB_ID) in tenant $TENANT_ID"
+          echo "SUB_ID=$SUB_ID"       >> "$GITHUB_ENV"
           echo "TENANT_ID=$TENANT_ID" >> "$GITHUB_ENV"
 
       - name: Bootstrap Terraform State Storage
         run: |
-          RESOURCE_GROUP="tfstate-rg"
+          RG="tfstate-rg"
           LOCATION="eastus"
-          SUFFIX=$(openssl rand -hex 4)
-          STORAGE_ACCOUNT="tfstate${SUFFIX}"
           CONTAINER="tfstate"
 
-          # Create resource group (ignore if exists)
-          az group create --name "$RESOURCE_GROUP" --location "$LOCATION" || true
+          # Reuse existing storage account if it exists
+          EXISTING=$(az storage account list \
+            --resource-group "$RG" \
+            --query "[?starts_with(name, 'tfstate')].name | [0]" \
+            -o tsv 2>/dev/null || true)
 
-          # Create storage account
-          az storage account create \
-            --name "$STORAGE_ACCOUNT" \
-            --resource-group "$RESOURCE_GROUP" \
-            --location "$LOCATION" \
-            --sku Standard_LRS \
-            --min-tls-version TLS1_2 2>&1
+          if [ -n "$EXISTING" ] && [ "$EXISTING" != "None" ]; then
+            echo "Reusing existing storage account: $EXISTING"
+            STORAGE_ACCOUNT="$EXISTING"
+          else
+            SUFFIX=$(openssl rand -hex 4)
+            STORAGE_ACCOUNT="tfstate${SUFFIX}"
+            echo "Creating new storage account: $STORAGE_ACCOUNT"
+            az group create --name "$RG" --location "$LOCATION" --output none || true
+            az storage account create \
+              --name "$STORAGE_ACCOUNT" \
+              --resource-group "$RG" \
+              --location "$LOCATION" \
+              --sku Standard_LRS \
+              --min-tls-version TLS1_2 \
+              --output none
+            az storage container create \
+              --name "$CONTAINER" \
+              --account-name "$STORAGE_ACCOUNT" \
+              --output none
+          fi
 
-          # Create blob container
-          az storage container create \
-            --name "$CONTAINER" \
-            --account-name "$STORAGE_ACCOUNT" 2>&1
-
-          echo "TF_STORAGE_ACCOUNT=$STORAGE_ACCOUNT" >> "$GITHUB_ENV"
+          echo "TF_STORAGE=$STORAGE_ACCOUNT" >> "$GITHUB_ENV"
           echo "Terraform state storage: $STORAGE_ACCOUNT"
 
       - name: Create Service Principal
         run: |
           SP_NAME="downstream-app-sp-$(date +%s)"
-          # Create SP with Contributor role on the subscription
           SP_JSON=$(az ad sp create-for-rbac \
             --name "$SP_NAME" \
             --role Contributor \
@@ -87,19 +112,18 @@ jobs:
           CLIENT_ID=$(echo "$SP_JSON" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d['appId'])")
           CLIENT_SECRET=$(echo "$SP_JSON" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d['password'])")
 
-          echo "ARM_CLIENT_ID=$CLIENT_ID"         >> "$GITHUB_ENV"
+          echo "::add-mask::$CLIENT_SECRET"
+          echo "ARM_CLIENT_ID=$CLIENT_ID"       >> "$GITHUB_ENV"
           echo "ARM_CLIENT_SECRET=$CLIENT_SECRET" >> "$GITHUB_ENV"
-          echo "Service principal '$SP_NAME' created."
+          echo "Service principal '$SP_NAME' created (appId: $CLIENT_ID)"
 
       - name: Generate SSH Key Pair
         run: |
           ssh-keygen -t ed25519 -f /tmp/downstream_deploy -N "" -C "downstream-app-deploy"
           SSH_PUB=$(cat /tmp/downstream_deploy.pub)
-          SSH_PRIV=$(cat /tmp/downstream_deploy)
-          echo "SSH_PUB=$SSH_PUB"   >> "$GITHUB_ENV"
-          # Store private key (newlines encoded)
-          printf '%s' "$SSH_PRIV" > /tmp/ssh_priv_encoded.txt
-          echo "SSH_PRIV_FILE=/tmp/ssh_priv_encoded.txt" >> "$GITHUB_ENV"
+          echo "SSH_PUB=$SSH_PUB" >> "$GITHUB_ENV"
+          # Encode private key preserving newlines
+          base64 -w0 /tmp/downstream_deploy > /tmp/downstream_deploy.b64
 
       - name: Set GitHub Actions Secrets
         env:
@@ -107,25 +131,25 @@ jobs:
           REPO: ${{ github.repository }}
         run: |
           set_secret() {
-            local name="$1"
-            local value="$2"
-            echo "Setting secret: $name"
-            gh secret set "$name" --repo "$REPO" --body "$value"
+            echo "Setting secret: $1"
+            gh secret set "$1" --repo "$REPO" --body "$2"
           }
 
           set_secret "ARM_CLIENT_ID"       "$ARM_CLIENT_ID"
           set_secret "ARM_CLIENT_SECRET"   "$ARM_CLIENT_SECRET"
           set_secret "ARM_TENANT_ID"       "$TENANT_ID"
           set_secret "ARM_SUBSCRIPTION_ID" "$SUB_ID"
-          set_secret "TF_STORAGE_ACCOUNT"  "$TF_STORAGE_ACCOUNT"
+          set_secret "TF_STORAGE_ACCOUNT"  "$TF_STORAGE"
           set_secret "DB_PASSWORD"         "${{ inputs.db_password }}"
           set_secret "FLASK_SECRET"        "${{ inputs.flask_secret }}"
           set_secret "SSH_PUBLIC_KEY"      "$SSH_PUB"
-          set_secret "SSH_PRIVATE_KEY"     "$(cat $SSH_PRIV_FILE)"
-          set_secret "UPSTREAM_URL"        "http://localhost:5000"
+          # Store private key as base64 to avoid newline issues
+          set_secret "SSH_PRIVATE_KEY_B64" "$(cat /tmp/downstream_deploy.b64)"
 
           echo ""
           echo "========================================================"
-          echo "  All GitHub secrets have been configured successfully!"
-          echo "  Next: go to Actions > Deploy to Azure > Run workflow"
+          echo "  All GitHub secrets configured successfully!"
+          echo ""
+          echo "  Next step: Actions → Deploy All-in-One → Run workflow"
           echo "========================================================"
+

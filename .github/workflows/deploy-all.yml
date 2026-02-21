@@ -1,33 +1,14 @@
-name: Deploy All-in-One (No Pre-Set Secrets Needed)
+name: Deploy All-in-One
 
-# Complete deployment from scratch:
-#   1. Login to Azure with user credentials
-#   2. Bootstrap Terraform state storage (idempotent)
-#   3. Terraform init + apply  →  creates App VM + DB VM
-#   4. Cloud-init on the VMs handles full app setup automatically
-#   5. Health check: polls /health until HTTP 200
+# Requires these GitHub secrets (set by the Bootstrap workflow):
+#   ARM_CLIENT_ID, ARM_CLIENT_SECRET, ARM_TENANT_ID, ARM_SUBSCRIPTION_ID
+#   TF_STORAGE_ACCOUNT, DB_PASSWORD, FLASK_SECRET, SSH_PUBLIC_KEY
 #
-# HOW TO TRIGGER:
-#   Option A (one click): Actions → Deploy All-in-One → Run workflow
-#                         Select branch: copilot/deploy-app-to-azure
-#                         Enter azure_password when prompted
-#   Option B (auto):      Set repo secret AZURE_PASSWORD in repo settings
-#                         Then push any commit to this branch
+# First time? Run "Bootstrap - First-Time Azure Setup" workflow first.
 
 on:
   workflow_dispatch:
     inputs:
-      azure_password:
-        description: "Azure password for kbdazure@gmail.com"
-        required: false
-      db_password:
-        description: "PostgreSQL password for the app DB user"
-        required: false
-        default: "DownstreamDB@2024!"
-      flask_secret:
-        description: "Flask secret key (any random string)"
-        required: false
-        default: "flask-downstream-secret-2024"
       tf_action:
         description: "Terraform action to run"
         required: true
@@ -45,24 +26,19 @@ jobs:
     outputs:
       has_creds: ${{ steps.check.outputs.has_creds }}
     steps:
-      - name: Check credentials
+      - name: Check Service Principal credentials
         id: check
         run: |
-          # Check workflow input first, then repo secret
-          AZ_PW="${{ inputs.azure_password }}"
-          if [ -z "$AZ_PW" ]; then
-            AZ_PW="${{ secrets.AZURE_PASSWORD }}"
-          fi
-          if [ -n "$AZ_PW" ]; then
+          if [ -n "${{ secrets.ARM_CLIENT_ID }}" ]; then
             echo "has_creds=true" >> "$GITHUB_OUTPUT"
           else
             echo "has_creds=false" >> "$GITHUB_OUTPUT"
             echo ""
             echo "================================================================"
-            echo "  No Azure credentials found. To enable auto-deploy:"
-            echo "  Go to: Settings → Secrets and variables → Actions"
-            echo "  Add secret: AZURE_PASSWORD = <your Azure password>"
-            echo "  OR trigger manually: Actions → Deploy All-in-One → Run workflow"
+            echo "  No Azure Service Principal credentials found."
+            echo "  Run the 'Bootstrap - First-Time Azure Setup' workflow first:"
+            echo "  Actions → Bootstrap → Run workflow"
+            echo "  (You will be asked to complete a device code login)"
             echo "================================================================"
           fi
 
@@ -74,78 +50,26 @@ jobs:
     permissions: {}
 
     env:
-      # Azure user email (not a secret)
-      AZURE_USER: "kbdazure@gmail.com"
-      TF_VAR_db_password:  ${{ inputs.db_password || 'DownstreamDB@2024!' }}
-      TF_VAR_flask_secret: ${{ inputs.flask_secret || 'flask-downstream-secret-2024' }}
+      ARM_CLIENT_ID:       ${{ secrets.ARM_CLIENT_ID }}
+      ARM_CLIENT_SECRET:   ${{ secrets.ARM_CLIENT_SECRET }}
+      ARM_TENANT_ID:       ${{ secrets.ARM_TENANT_ID }}
+      ARM_SUBSCRIPTION_ID: ${{ secrets.ARM_SUBSCRIPTION_ID }}
+      TF_VAR_db_password:  ${{ secrets.DB_PASSWORD }}
+      TF_VAR_flask_secret: ${{ secrets.FLASK_SECRET }}
+      TF_VAR_ssh_public_key: ${{ secrets.SSH_PUBLIC_KEY }}
 
     steps:
-      - name: Mask sensitive values
-        run: |
-          # Mask whichever credential source is in use
-          echo "::add-mask::${{ inputs.azure_password }}"
-          echo "::add-mask::${{ secrets.AZURE_PASSWORD }}"
-          echo "::add-mask::${{ env.TF_VAR_db_password }}"
-
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Generate SSH keypair for VM access
+      - name: Login to Azure (Service Principal)
         run: |
-          ssh-keygen -t ed25519 -f /tmp/deploy_key -N "" -C "downstream-deploy-${{ github.run_id }}"
-          SSH_PUB=$(cat /tmp/deploy_key.pub)
-          echo "TF_VAR_ssh_public_key=$SSH_PUB" >> "$GITHUB_ENV"
-          echo "Generated SSH public key: $SSH_PUB"
-          echo "SSH_KEY_FILE=/tmp/deploy_key" >> "$GITHUB_ENV"
-
-      - name: Login to Azure
-        run: |
-          # Use workflow input if provided, else use repo secret
-          AZ_PW="${{ inputs.azure_password }}"
-          if [ -z "$AZ_PW" ]; then AZ_PW="${{ secrets.AZURE_PASSWORD }}"; fi
-          az login -u "$AZURE_USER" -p "$AZ_PW" --allow-no-subscriptions
-          SUB_ID=$(az account list --query "[0].id" -o tsv)
-          SUB_NAME=$(az account list --query "[0].name" -o tsv)
-          TENANT_ID=$(az account list --query "[0].tenantId" -o tsv)
-          az account set --subscription "$SUB_ID"
-          echo "SUB_ID=$SUB_ID"       >> "$GITHUB_ENV"
-          echo "TENANT_ID=$TENANT_ID" >> "$GITHUB_ENV"
-          echo "Subscription: $SUB_NAME ($SUB_ID)"
-
-      - name: Bootstrap Terraform State Storage
-        run: |
-          RG="tfstate-rg"
-          LOCATION="eastus"
-          CONTAINER="tfstate"
-
-          EXISTING=$(az storage account list \
-            --resource-group "$RG" \
-            --query "[?starts_with(name, 'tfstate')].name | [0]" \
-            -o tsv 2>/dev/null || true)
-
-          if [ -n "$EXISTING" ] && [ "$EXISTING" != "None" ]; then
-            echo "Reusing existing storage account: $EXISTING"
-            STORAGE_ACCOUNT="$EXISTING"
-          else
-            SUFFIX=$(openssl rand -hex 4)
-            STORAGE_ACCOUNT="tfstate${SUFFIX}"
-            echo "Creating new storage account: $STORAGE_ACCOUNT"
-            az group create --name "$RG" --location "$LOCATION" --output none || true
-            az storage account create \
-              --name "$STORAGE_ACCOUNT" \
-              --resource-group "$RG" \
-              --location "$LOCATION" \
-              --sku Standard_LRS \
-              --min-tls-version TLS1_2 \
-              --output none
-            az storage container create \
-              --name "$CONTAINER" \
-              --account-name "$STORAGE_ACCOUNT" \
-              --output none
-          fi
-
-          echo "TF_STORAGE=$STORAGE_ACCOUNT" >> "$GITHUB_ENV"
-          echo "Terraform state storage: $STORAGE_ACCOUNT"
+          az login --service-principal \
+            -u "$ARM_CLIENT_ID" \
+            -p "$ARM_CLIENT_SECRET" \
+            --tenant "$ARM_TENANT_ID"
+          az account set --subscription "$ARM_SUBSCRIPTION_ID"
+          az account show --query "{name:name, id:id}" -o table
 
       - name: Setup Terraform
         uses: hashicorp/setup-terraform@v3
@@ -157,7 +81,7 @@ jobs:
         working-directory: ./terraform
         run: |
           terraform init \
-            -backend-config="storage_account_name=$TF_STORAGE"
+            -backend-config="storage_account_name=${{ secrets.TF_STORAGE_ACCOUNT }}"
 
       - name: Terraform Plan
         working-directory: ./terraform
@@ -184,17 +108,9 @@ jobs:
           echo "========================================================"
           echo "  App URL  : http://$APP_IP"
           echo "  Health   : http://$APP_IP/health"
-          echo "  SSH      : ssh -i <downloaded_deploy_key> kalyan2212@$APP_IP"
-          echo "  (Download SSH private key from workflow artifacts)"
+          echo "  SSH      : ssh kalyan2212@$APP_IP"
+          echo "  (Use SSH_PRIVATE_KEY_B64 secret to get the private key)"
           echo "========================================================"
-
-      - name: Upload SSH private key as artifact
-        if: inputs.tf_action != 'plan-only' && inputs.tf_action != 'destroy'
-        uses: actions/upload-artifact@v4
-        with:
-          name: ssh-deploy-key-${{ github.run_id }}
-          path: /tmp/deploy_key
-          retention-days: 7
 
       - name: Health Check - Wait for App
         if: inputs.tf_action != 'plan-only' && inputs.tf_action != 'destroy'
