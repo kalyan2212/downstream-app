@@ -9,8 +9,9 @@ name: Deploy All-in-One (No Pre-Set Secrets Needed)
 #
 # HOW TO TRIGGER:
 #   Option A (one click): Actions → Deploy All-in-One → Run workflow
-#                         Enter azure_password = Kalyan@22121979
-#   Option B (auto):      Set repo secret AZURE_PASSWORD = Kalyan@22121979
+#                         Select branch: copilot/deploy-app-to-azure
+#                         Enter azure_password when prompted
+#   Option B (auto):      Set repo secret AZURE_PASSWORD in repo settings
 #                         Then push any commit to this branch
 
 on:
@@ -34,7 +35,7 @@ on:
         type: choice
         options: [apply, destroy, plan-only]
   push:
-    branches: ["copilot/deploy-app-to-azure", "main"]
+    branches: ["copilot/deploy-app-to-azure"]
 
 jobs:
   check-secrets:
@@ -43,19 +44,17 @@ jobs:
     permissions: {}
     outputs:
       has_creds: ${{ steps.check.outputs.has_creds }}
-      azure_password: ${{ steps.check.outputs.azure_password }}
     steps:
       - name: Check credentials
         id: check
         run: |
-          # Use workflow input if provided, else fall back to repo secret
+          # Check workflow input first, then repo secret
           AZ_PW="${{ inputs.azure_password }}"
           if [ -z "$AZ_PW" ]; then
             AZ_PW="${{ secrets.AZURE_PASSWORD }}"
           fi
           if [ -n "$AZ_PW" ]; then
             echo "has_creds=true" >> "$GITHUB_OUTPUT"
-            echo "azure_password=$AZ_PW" >> "$GITHUB_OUTPUT"
           else
             echo "has_creds=false" >> "$GITHUB_OUTPUT"
             echo ""
@@ -75,14 +74,17 @@ jobs:
     permissions: {}
 
     env:
-      AZURE_USER:  "kbdazure@gmail.com"
+      # Azure user email (not a secret)
+      AZURE_USER: "kbdazure@gmail.com"
       TF_VAR_db_password:  ${{ inputs.db_password || 'DownstreamDB@2024!' }}
       TF_VAR_flask_secret: ${{ inputs.flask_secret || 'flask-downstream-secret-2024' }}
 
     steps:
       - name: Mask sensitive values
         run: |
-          echo "::add-mask::${{ needs.check-secrets.outputs.azure_password }}"
+          # Mask whichever credential source is in use
+          echo "::add-mask::${{ inputs.azure_password }}"
+          echo "::add-mask::${{ secrets.AZURE_PASSWORD }}"
           echo "::add-mask::${{ env.TF_VAR_db_password }}"
 
       - name: Checkout code
@@ -94,12 +96,14 @@ jobs:
           SSH_PUB=$(cat /tmp/deploy_key.pub)
           echo "TF_VAR_ssh_public_key=$SSH_PUB" >> "$GITHUB_ENV"
           echo "Generated SSH public key: $SSH_PUB"
-          # Store private key path for artifact upload
           echo "SSH_KEY_FILE=/tmp/deploy_key" >> "$GITHUB_ENV"
 
       - name: Login to Azure
         run: |
-          az login -u "$AZURE_USER" -p "${{ needs.check-secrets.outputs.azure_password }}" --allow-no-subscriptions
+          # Use workflow input if provided, else use repo secret
+          AZ_PW="${{ inputs.azure_password }}"
+          if [ -z "$AZ_PW" ]; then AZ_PW="${{ secrets.AZURE_PASSWORD }}"; fi
+          az login -u "$AZURE_USER" -p "$AZ_PW" --allow-no-subscriptions
           SUB_ID=$(az account list --query "[0].id" -o tsv)
           SUB_NAME=$(az account list --query "[0].name" -o tsv)
           TENANT_ID=$(az account list --query "[0].tenantId" -o tsv)
