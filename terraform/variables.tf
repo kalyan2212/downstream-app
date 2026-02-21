@@ -14,7 +14,7 @@ variable "db_subnet_prefix"   { default = "10.0.2.0/24" }
 
 variable "vm_size" {
   description = "Azure VM size"
-  default     = "Standard_B2s"
+  default     = "Standard_B1s"
 }
 
 variable "admin_username" {
@@ -32,12 +32,6 @@ variable "db_user"     { default = "downstream_user" }
 variable "db_password" {
   description = "PostgreSQL downstream user password"
   sensitive   = true
-}
-
-variable "replication_password" {
-  description = "PostgreSQL replication user password"
-  sensitive   = true
-  default     = ""
 }
 
 variable "flask_secret" {
@@ -59,9 +53,4 @@ variable "upstream_api_key" {
 variable "github_repo_url" {
   description = "HTTPS clone URL of the GitHub repo"
   default     = "https://github.com/kalyan2212/downstream-app.git"
-}
-
-variable "availability_zone" {
-  description = "Azure Availability Zone"
-  default     = "1"
 }
