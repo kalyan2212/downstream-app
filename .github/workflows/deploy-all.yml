@@ -88,6 +88,15 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
+      - name: Generate SSH keypair for VM access
+        run: |
+          ssh-keygen -t ed25519 -f /tmp/deploy_key -N "" -C "downstream-deploy-${{ github.run_id }}"
+          SSH_PUB=$(cat /tmp/deploy_key.pub)
+          echo "TF_VAR_ssh_public_key=$SSH_PUB" >> "$GITHUB_ENV"
+          echo "Generated SSH public key: $SSH_PUB"
+          # Store private key path for artifact upload
+          echo "SSH_KEY_FILE=/tmp/deploy_key" >> "$GITHUB_ENV"
+
       - name: Login to Azure
         run: |
           az login -u "$AZURE_USER" -p "${{ needs.check-secrets.outputs.azure_password }}" --allow-no-subscriptions
@@ -171,8 +180,17 @@ jobs:
           echo "========================================================"
           echo "  App URL  : http://$APP_IP"
           echo "  Health   : http://$APP_IP/health"
-          echo "  SSH      : ssh kalyan2212@$APP_IP"
+          echo "  SSH      : ssh -i <downloaded_deploy_key> kalyan2212@$APP_IP"
+          echo "  (Download SSH private key from workflow artifacts)"
           echo "========================================================"
+
+      - name: Upload SSH private key as artifact
+        if: inputs.tf_action != 'plan-only' && inputs.tf_action != 'destroy'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ssh-deploy-key-${{ github.run_id }}
+          path: /tmp/deploy_key
+          retention-days: 7
 
       - name: Health Check - Wait for App
         if: inputs.tf_action != 'plan-only' && inputs.tf_action != 'destroy'

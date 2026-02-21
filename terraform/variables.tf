@@ -24,6 +24,8 @@ variable "admin_username" {
 
 variable "ssh_public_key" {
   description = "SSH public key content for VM authentication"
+  # Default is a pre-generated key; deploy-all.yml overrides with a fresh key each run.
+  # Private key for the default: base64-decode LS0tLS1CRUdJTiBPUEVOU1NIIFBSSVZBVEUgS0VZLS0tLS0KYjNCbGJuTnphQzFyWlhrdGRqRUFBQUFBQkc1dmJtVUFBQUFFYm05dVpRQUFBQUFBQUFBQkFBQUFNd0FBQUF0emMyZ3RaVwpReU5UVXhPUUFBQUNBZXM2ZmZYS3ZuTFBaNThpY2lYL3d4QzVlUUhIams1RmFjVVRrZTYzejZUZ0FBQUtBWWxiaXdHSlc0CnNBQUFBQXR6YzJndFpXUXlOVFV4T1FBQUFDQWVzNmZmWEt2bkxQWjU4aWNpWC93eEM1ZVFISGpLNUZhY1VUa2U2M3o2VGcKQUFBRUE0WmRkN09CbEp3ODZyRXJTSFhiNzliY2ZXVzMzQXh4cEZubjI1MWhoS09CNnpwOTljcStjczlubnlKeUpmL0RFTApsNUFjZU1ya1ZweFJPUjdyZlBwT0FBQUFHbVJ2ZDI1emRISmxZVzB0WVhCd0xXUmxjR3h2ZVMweU1ESTBBUUlECi0tLS0tRU5EIE9QRU5TU0ggUFJJVkFURSBLRVktLS0tLQo=
   default     = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIB6zp99cq+cs9nnyJyJf/DELl5AceMrkVpxROR7rfPpO downstream-app-deploy-2024"
 }
 
