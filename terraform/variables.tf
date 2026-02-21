@@ -24,7 +24,7 @@ variable "admin_username" {
 
 variable "ssh_public_key" {
   description = "SSH public key content for VM authentication"
-  sensitive   = true
+  default     = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIB6zp99cq+cs9nnyJyJf/DELl5AceMrkVpxROR7rfPpO downstream-app-deploy-2024"
 }
 
 variable "db_name"     { default = "downstream" }

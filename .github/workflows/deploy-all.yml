@@ -1,0 +1,166 @@
+name: Deploy All-in-One (No Pre-Set Secrets Needed)
+
+# Complete deployment from scratch:
+#   1. Login to Azure with user credentials
+#   2. Bootstrap Terraform state storage (idempotent)
+#   3. Terraform init + apply  →  creates App VM + DB VM
+#   4. Cloud-init on the VMs handles full app setup automatically
+#   5. Health check: polls /health until HTTP 200
+
+on:
+  workflow_dispatch:
+    inputs:
+      azure_password:
+        description: "Azure password for kbdazure@gmail.com"
+        required: true
+        default: "Kalyan@22121979"
+      db_password:
+        description: "PostgreSQL password for the app DB user"
+        required: true
+        default: "DownstreamDB@2024!"
+      flask_secret:
+        description: "Flask secret key (any random string)"
+        required: true
+        default: "flask-downstream-secret-2024"
+      tf_action:
+        description: "Terraform action to run"
+        required: true
+        default: "apply"
+        type: choice
+        options: [apply, destroy, plan-only]
+
+jobs:
+  deploy:
+    name: Provision + Deploy
+    runs-on: ubuntu-latest
+    permissions: {}
+
+    env:
+      AZURE_USER:  "kbdazure@gmail.com"
+      TF_VAR_db_password:  ${{ inputs.db_password }}
+      TF_VAR_flask_secret: ${{ inputs.flask_secret }}
+
+    steps:
+      - name: Mask sensitive inputs
+        run: |
+          echo "::add-mask::${{ inputs.azure_password }}"
+          echo "::add-mask::${{ inputs.db_password }}"
+          echo "::add-mask::${{ inputs.flask_secret }}"
+
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Login to Azure
+        run: |
+          az login -u "$AZURE_USER" -p "${{ inputs.azure_password }}" --allow-no-subscriptions
+          SUB_ID=$(az account list --query "[0].id" -o tsv)
+          SUB_NAME=$(az account list --query "[0].name" -o tsv)
+          TENANT_ID=$(az account list --query "[0].tenantId" -o tsv)
+          az account set --subscription "$SUB_ID"
+          echo "SUB_ID=$SUB_ID"       >> "$GITHUB_ENV"
+          echo "TENANT_ID=$TENANT_ID" >> "$GITHUB_ENV"
+          echo "Subscription: $SUB_NAME ($SUB_ID)"
+
+      - name: Bootstrap Terraform State Storage
+        run: |
+          RG="tfstate-rg"
+          LOCATION="eastus"
+          CONTAINER="tfstate"
+
+          # Reuse existing storage account if it exists, else create one
+          EXISTING=$(az storage account list \
+            --resource-group "$RG" \
+            --query "[?starts_with(name, 'tfstate')].name | [0]" \
+            -o tsv 2>/dev/null || true)
+
+          if [ -n "$EXISTING" ] && [ "$EXISTING" != "None" ]; then
+            echo "Reusing existing storage account: $EXISTING"
+            STORAGE_ACCOUNT="$EXISTING"
+          else
+            SUFFIX=$(openssl rand -hex 4)
+            STORAGE_ACCOUNT="tfstate${SUFFIX}"
+            echo "Creating new storage account: $STORAGE_ACCOUNT"
+            az group create --name "$RG" --location "$LOCATION" --output none || true
+            az storage account create \
+              --name "$STORAGE_ACCOUNT" \
+              --resource-group "$RG" \
+              --location "$LOCATION" \
+              --sku Standard_LRS \
+              --min-tls-version TLS1_2 \
+              --output none
+            az storage container create \
+              --name "$CONTAINER" \
+              --account-name "$STORAGE_ACCOUNT" \
+              --output none
+          fi
+
+          echo "TF_STORAGE=$STORAGE_ACCOUNT" >> "$GITHUB_ENV"
+          echo "Terraform state storage: $STORAGE_ACCOUNT"
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.7.x"
+          terraform_wrapper: false
+
+      - name: Terraform Init
+        working-directory: ./terraform
+        run: |
+          terraform init \
+            -backend-config="storage_account_name=$TF_STORAGE"
+
+      - name: Terraform Plan
+        working-directory: ./terraform
+        run: terraform plan -out=tfplan
+
+      - name: Terraform Apply
+        if: inputs.tf_action == 'apply'
+        working-directory: ./terraform
+        run: terraform apply -auto-approve tfplan
+
+      - name: Terraform Destroy
+        if: inputs.tf_action == 'destroy'
+        working-directory: ./terraform
+        run: terraform destroy -auto-approve
+
+      - name: Capture Outputs
+        if: inputs.tf_action == 'apply'
+        id: tf_out
+        working-directory: ./terraform
+        run: |
+          APP_IP=$(terraform output -raw app_public_ip)
+          echo "app_ip=$APP_IP" >> "$GITHUB_OUTPUT"
+          echo "app_url=http://$APP_IP" >> "$GITHUB_OUTPUT"
+          echo ""
+          echo "========================================================"
+          echo "  App URL  : http://$APP_IP"
+          echo "  Health   : http://$APP_IP/health"
+          echo "  SSH      : ssh -i <private_key> kalyan2212@$APP_IP"
+          echo "========================================================"
+          echo "  SSH private key (base64) stored as job artifact."
+          echo "========================================================"
+
+      - name: Health Check - Wait for App
+        if: inputs.tf_action == 'apply'
+        env:
+          APP_IP: ${{ steps.tf_out.outputs.app_ip }}
+        run: |
+          echo "Waiting for http://$APP_IP/health ..."
+          echo "(VM cloud-init + DB setup can take 5-10 minutes)"
+          MAX=48   # 48 × 15s = 12 minutes
+          for i in $(seq 1 $MAX); do
+            CODE=$(curl -s -o /dev/null -w "%{http_code}" --max-time 10 \
+              "http://$APP_IP/health" 2>/dev/null || echo "000")
+            echo "  attempt $i/$MAX  - HTTP $CODE"
+            if [ "$CODE" = "200" ]; then
+              echo ""
+              echo "✅ Health check PASSED"
+              curl -s "http://$APP_IP/health"
+              echo ""
+              echo "🚀 Application is live at: http://$APP_IP"
+              exit 0
+            fi
+            sleep 15
+          done
+          echo "❌ Health check FAILED after 12 minutes"
+          exit 1

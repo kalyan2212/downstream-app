@@ -1,26 +1,50 @@
 name: Deploy to Azure
 
+# Code-update workflow: runs Terraform (detect drift) + health check.
+# Requires AZURE_PASSWORD secret to be set in repo settings.
+# For first-time provisioning, use the "Deploy All-in-One" workflow instead.
+
 on:
   push:
     branches: [main]
   workflow_dispatch:
 
-env:
-  ARM_CLIENT_ID:       ${{ secrets.ARM_CLIENT_ID }}
-  ARM_CLIENT_SECRET:   ${{ secrets.ARM_CLIENT_SECRET }}
-  ARM_TENANT_ID:       ${{ secrets.ARM_TENANT_ID }}
-  ARM_SUBSCRIPTION_ID: ${{ secrets.ARM_SUBSCRIPTION_ID }}
-
 jobs:
   terraform:
-    name: Terraform - Provision Infrastructure
+    name: Terraform - Provision/Update Infrastructure
     runs-on: ubuntu-latest
+    permissions: {}
+    # Skip if Azure credentials are not yet configured
+    if: ${{ secrets.AZURE_PASSWORD != '' || secrets.ARM_CLIENT_ID != '' }}
     outputs:
       app_public_ip: ${{ steps.tf_output.outputs.app_public_ip }}
 
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+
+      - name: Login to Azure
+        run: |
+          echo "::add-mask::${{ secrets.AZURE_PASSWORD }}"
+          if [ -n "${{ secrets.ARM_CLIENT_ID }}" ]; then
+            # Use service principal if available
+            az login --service-principal \
+              -u "${{ secrets.ARM_CLIENT_ID }}" \
+              -p "${{ secrets.ARM_CLIENT_SECRET }}" \
+              --tenant "${{ secrets.ARM_TENANT_ID }}"
+            az account set --subscription "${{ secrets.ARM_SUBSCRIPTION_ID }}"
+          else
+            # Fall back to user credentials
+            az login -u "kbdazure@gmail.com" -p "${{ secrets.AZURE_PASSWORD }}"
+          fi
+
+      - name: Get Terraform State Storage
+        run: |
+          STORAGE=$(az storage account list \
+            --resource-group "tfstate-rg" \
+            --query "[?starts_with(name, 'tfstate')].name | [0]" \
+            -o tsv 2>/dev/null || true)
+          echo "TF_STORAGE=$STORAGE" >> "$GITHUB_ENV"
 
       - name: Setup Terraform
         uses: hashicorp/setup-terraform@v3
@@ -32,26 +56,20 @@ jobs:
         working-directory: ./terraform
         run: |
           terraform init \
-            -backend-config="storage_account_name=${{ secrets.TF_STORAGE_ACCOUNT }}"
+            -backend-config="storage_account_name=$TF_STORAGE"
 
       - name: Terraform Plan
         working-directory: ./terraform
         env:
-          TF_VAR_db_password:    ${{ secrets.DB_PASSWORD }}
-          TF_VAR_ssh_public_key: ${{ secrets.SSH_PUBLIC_KEY }}
-          TF_VAR_flask_secret:   ${{ secrets.FLASK_SECRET }}
-          TF_VAR_admin_username: "kalyan2212"
-          TF_VAR_upstream_url:   ${{ secrets.UPSTREAM_URL }}
+          TF_VAR_db_password:  ${{ secrets.DB_PASSWORD }}
+          TF_VAR_flask_secret: ${{ secrets.FLASK_SECRET }}
         run: terraform plan -out=tfplan
 
       - name: Terraform Apply
         working-directory: ./terraform
         env:
-          TF_VAR_db_password:    ${{ secrets.DB_PASSWORD }}
-          TF_VAR_ssh_public_key: ${{ secrets.SSH_PUBLIC_KEY }}
-          TF_VAR_flask_secret:   ${{ secrets.FLASK_SECRET }}
-          TF_VAR_admin_username: "kalyan2212"
-          TF_VAR_upstream_url:   ${{ secrets.UPSTREAM_URL }}
+          TF_VAR_db_password:  ${{ secrets.DB_PASSWORD }}
+          TF_VAR_flask_secret: ${{ secrets.FLASK_SECRET }}
         run: terraform apply tfplan
 
       - name: Capture Terraform Outputs
@@ -65,43 +83,12 @@ jobs:
           echo "  SSH     : ssh kalyan2212@$APP_IP"
           echo "===================================="
 
-  deploy:
-    name: Deploy - SSH Code Push
-    needs: terraform
-    runs-on: ubuntu-latest
-
-    steps:
-      - name: Deploy to App VM via SSH
-        env:
-          APP_IP:          ${{ needs.terraform.outputs.app_public_ip }}
-          SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
-        run: |
-          mkdir -p ~/.ssh
-          printf '%s\n' "$SSH_PRIVATE_KEY" > ~/.ssh/deploy_key
-          chmod 600 ~/.ssh/deploy_key
-
-          SSH_OPTS="-i ~/.ssh/deploy_key -o StrictHostKeyChecking=no -o ConnectTimeout=30 -o BatchMode=yes"
-
-          DEPLOY_SCRIPT='
-            set -e
-            cd /opt/downstream-app
-            git pull origin main
-            ./venv/bin/pip install -r requirements.txt --quiet
-            sudo systemctl restart downstream
-            echo "Restart successful on $(hostname)"
-          '
-
-          echo "=== Deploying to App VM at $APP_IP ==="
-          ssh $SSH_OPTS kalyan2212@"$APP_IP" "$DEPLOY_SCRIPT" \
-            || echo "[WARN] SSH failed - VM may still be initializing (cloud-init running)"
-
-          echo "Application URL: http://$APP_IP"
-
   health-check:
     name: Health Check
-    needs: [terraform, deploy]
+    needs: terraform
     runs-on: ubuntu-latest
     permissions: {}
+    if: needs.terraform.result == 'success'
 
     steps:
       - name: Wait for app to be ready

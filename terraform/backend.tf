@@ -9,16 +9,19 @@ terraform {
   }
 
   # Remote state in Azure Blob Storage.
-  # Storage account is pre-created by scripts/bootstrap_tfstate.sh
-  # Value is passed via -backend-config in CI.
+  # Bootstrapped by the deploy-all.yml workflow on first run.
   backend "azurerm" {
     resource_group_name = "tfstate-rg"
     container_name      = "tfstate"
     key                 = "downstream.tfstate"
-    # storage_account_name supplied at init time via -backend-config
+    # storage_account_name passed via -backend-config at init time
+    # use_azuread_auth = true (uses az login credentials)
   }
 }
 
 provider "azurerm" {
   features {}
+  # Authenticates using Azure CLI credentials (az login)
+  # No ARM_CLIENT_ID / ARM_CLIENT_SECRET needed
+  use_cli = true
 }
